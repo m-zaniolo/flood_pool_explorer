@@ -1,0 +1,290 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Flood insurance pool explorer</title>
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
+<style>
+  body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:8px 18px;color:#1a1a1a}
+  h3{margin:.2em 0}
+  h4{margin:12px 0 0}
+  .hint{color:#666;font-size:12.5px;margin:0 0 4px}
+  .bar{background:#eef3f8;padding:8px 12px;border-radius:6px;margin:6px 0;display:flex;
+       align-items:center;gap:10px;flex-wrap:wrap}
+  .bar label{font-size:14px}
+  .row{display:flex;gap:10px}
+  .g{width:100%}
+  #parcoords{flex:1.15}#network{flex:1}#scatter{flex:1}#map{flex:1.3}
+  #fdiv,#chronic,#strain,#defection{flex:1}
+  select,button{font:inherit;padding:2px 4px}
+  .radio{display:inline-flex;gap:8px;align-items:center}
+  .radio label{font-weight:400}
+  hr{margin:14px 0 8px;border:none;border-top:1px solid #e3e6ea}
+  .foot{color:#888;font-size:12px;margin:16px 0}
+</style>
+</head>
+<body>
+<h3>Flood insurance pool explorer</h3>
+<div class="bar">
+  <b>pricing:</b><span class="radio" id="price"></span>
+  <b style="margin-left:14px">vote:</b><span class="radio" id="vote"></span>
+  <label style="margin-left:14px">detail (ε thinning):</label>
+  <input type="range" min="3" max="6" step="1" value="5" id="bins" style="width:160px">
+  <span id="binsval">5</span>
+  <button id="reset" style="margin-left:8px">reset brush</button>
+</div>
+
+<h4>The Pareto frontier at a glance</h4>
+<div class="hint">Every line is a Pareto-optimal pooling. Brush any axis to select a trade-off; the
+  cluster map redraws over the selection.</div>
+<div class="row"><div id="parcoords" class="g"></div><div id="network" class="g"></div></div>
+
+<hr>
+<h4>One solution up close</h4>
+<div class="hint">Click a point in the scatter to inspect that partition — its pools, risk, and
+  fairness in detail.</div>
+<div class="bar" style="background:none;padding:0">
+  <label>scatter x:</label><select id="xk"></select>
+  <label>y:</label><select id="yk"></select>
+</div>
+<div class="row"><div id="scatter" class="g"></div><div id="map" class="g"></div></div>
+<div class="row"><div id="fdiv" class="g"></div><div id="chronic" class="g"></div></div>
+<div class="row"><div id="strain" class="g"></div><div id="defection" class="g"></div></div>
+<div id="timeseries" class="g"></div>
+<div class="foot">Precomputed static build — no server. Data: data.json.</div>
+
+<script>
+const PALETTE = ["#7F3C8D","#11A579","#3969AC","#F2B701","#E73F74","#80BA5A","#E68310","#008695",
+                 "#CF1C90","#f97b72","#4b4b8f","#A5AA99"];
+const CLUSTER_PAL = ["#d62728","#1f77b4","#ff7f0e","#2ca02c","#9467bd","#8c564b","#e377c2",
+                     "#17becf","#bcbd22","#7f7f7f"];
+const GREY="#d9d9d9", STRONG_WEAK="rgba(150,150,150,0.16)";
+const THR_WEAK=0.60, THR_STRONG=0.75;
+
+let DATA, META, OBJS, CELL, cell, bins=5, constraints={}, sel=null;
+
+const $=id=>document.getElementById(id);
+const objIdx=k=>OBJS.indexOf(k);
+const rowObj=(row,k)=>row[objIdx(k)];
+const rowZ=row=>row.slice(OBJS.length);
+
+fetch("data.json").then(r=>r.json()).then(d=>{ DATA=d; META=d.meta; OBJS=META.objectives; init(); });
+
+function radio(host, opts, val, cb){
+  host.innerHTML="";
+  opts.forEach(([v,lab])=>{
+    const id=host.id+"_"+v;
+    const l=document.createElement("label");
+    l.innerHTML=`<input type="radio" name="${host.id}" value="${v}" ${v===val?"checked":""}> ${lab}`;
+    l.querySelector("input").addEventListener("change",()=>cb(v));
+    host.appendChild(l);
+  });
+}
+
+function init(){
+  radio($("price"), META.pricings.map(p=>[p,META.pricing_labels[p]]), META.pricings[0], v=>{price=v;newCell();});
+  radio($("vote"), META.votes.map(v=>[v,"one "+v+" one vote"]), META.votes[0], v=>{vote=v;newCell();});
+  OBJS.forEach(o=>{
+    $("xk").add(new Option(META.labels[o],o));
+    $("yk").add(new Option(META.labels[o],o));
+  });
+  $("xk").value=OBJS[0]; $("yk").value=OBJS[1];
+  $("xk").onchange=$("yk").onchange=drawScatter;
+  $("bins").oninput=e=>{bins=+e.target.value;$("binsval").textContent=bins;constraints={};drawAll();};
+  $("reset").onclick=()=>{constraints={};drawParcoords();updateBrush();};
+  window.price=META.pricings[0]; window.vote=META.votes[0];
+  newCell();
+}
+
+function newCell(){ cell=price+"|"+vote; CELL=DATA.cells[cell]; constraints={}; drawAll(); }
+
+function drawAll(){ drawParcoords(); updateBrush(); drawScatter(); }
+
+// ---- selection helpers ----
+function passes(row){
+  for(const k in constraints){
+    const rg=constraints[k]; if(!rg) continue;
+    const v=row[+k]; const ranges=Array.isArray(rg[0])?rg:[rg];
+    if(!ranges.some(([lo,hi])=>v>=lo&&v<=hi)) return false;
+  }
+  return true;
+}
+const shown=()=>CELL.shown[bins];
+const scatterSubset=()=>{ const s=shown().filter(i=>passes(CELL.front[i])); return s.length?s:shown(); };
+const networkSubset=()=>{ const all=[]; for(let i=0;i<CELL.front.length;i++) if(passes(CELL.front[i])) all.push(i); return all; };
+function defaultSel(sub){
+  let best=sub[0], bd=1e9;
+  sub.forEach(i=>{ const d=Math.abs(rowObj(CELL.front[i],"F_div")-0.30); if(d<bd){bd=d;best=i;} });
+  return best;
+}
+
+// ---- parcoords ----
+function drawParcoords(){
+  const idx=shown();
+  const dims=OBJS.map((o,j)=>{
+    const d={label:META.labels[o], values:idx.map(i=>CELL.front[i][j])};
+    if(constraints[j]) d.constraintrange=constraints[j];
+    return d;
+  });
+  const color=idx.map(i=>rowObj(CELL.front[i],"F_div"));
+  Plotly.react("parcoords",[{type:"parcoords",
+    line:{color,colorscale:"Viridis",showscale:true,colorbar:{title:"Diversification",len:0.8}},
+    dimensions:dims}],
+    {margin:{l:60,r:30,t:20,b:30},height:540},{displayModeBar:false});
+  $("parcoords").removeAllListeners&&$("parcoords").removeAllListeners("plotly_restyle");
+  $("parcoords").on("plotly_restyle",()=>{
+    const dd=$("parcoords").data[0].dimensions;
+    constraints={};
+    dd.forEach((d,j)=>{ if(d.constraintrange) constraints[j]=d.constraintrange; });
+    updateBrush();
+  });
+}
+function updateBrush(){ drawNetwork(); drawScatter(); }
+
+// ---- network ----
+function coMatrix(indices){
+  const n=META.usps.length, co=Array.from({length:n},()=>new Float64Array(n));
+  indices.forEach(i=>{ const z=rowZ(CELL.front[i]);
+    for(let a=0;a<n;a++) for(let b=a;b<n;b++) if(z[a]===z[b]){co[a][b]++;co[b][a]++;} });
+  const m=indices.length||1;
+  for(let a=0;a<n;a++) for(let b=0;b<n;b++) co[a][b]/=m;
+  return co;
+}
+function clusters(co){                                   // components of >=THR_STRONG graph, on ring order
+  const ring=META.ring, n=ring.length, U=META.usps;
+  const gi=ring.map(s=>U.indexOf(s));
+  const adj=Array.from({length:n},()=>[]);
+  for(let a=0;a<n;a++)for(let b=a+1;b<n;b++) if(co[gi[a]][gi[b]]>=THR_STRONG){adj[a].push(b);adj[b].push(a);}
+  const comp=new Array(n).fill(-1); let cid=0;
+  for(let s=0;s<n;s++){ if(comp[s]!==-1||!adj[s].length) continue; const st=[s];comp[s]=cid;
+    while(st.length){const u=st.pop(); adj[u].forEach(v=>{if(comp[v]===-1){comp[v]=cid;st.push(v);}});} cid++; }
+  return comp;
+}
+function bezier(na,nb){ const cx=0.15*(na[0]+nb[0]),cy=0.15*(na[1]+nb[1]),xs=[],ys=[];
+  for(let t=0;t<=1.0001;t+=1/21){const u=1-t; xs.push(u*u*na[0]+2*u*t*cx+t*t*nb[0]); ys.push(u*u*na[1]+2*u*t*cy+t*t*nb[1]);}
+  return [xs,ys]; }
+function drawNetwork(){
+  const sub=networkSubset(), co=coMatrix(sub);
+  const ring=META.ring, n=ring.length, U=META.usps, gi=ring.map(s=>U.indexOf(s));
+  const node=ring.map((_,k)=>{const a=(90-k*360/n)*Math.PI/180; return [Math.cos(a),Math.sin(a)];});
+  const comp=clusters(co);
+  const traces=[];
+  // weak grey arcs + strong per-cluster arcs
+  const weakX=[],weakY=[], strongByCl={};
+  for(let a=0;a<n;a++)for(let b=a+1;b<n;b++){
+    const c=co[gi[a]][gi[b]]; if(c<THR_WEAK) continue;
+    const [xs,ys]=bezier(node[a],node[b]);
+    if(c>=THR_STRONG){ const cl=comp[a]; (strongByCl[cl]=strongByCl[cl]||[[],[]]);
+      strongByCl[cl][0].push(...xs,null); strongByCl[cl][1].push(...ys,null); }
+    else { weakX.push(...xs,null); weakY.push(...ys,null); }
+  }
+  traces.push({x:weakX,y:weakY,mode:"lines",line:{color:STRONG_WEAK,width:0.7},hoverinfo:"skip",showlegend:false});
+  for(const cl in strongByCl){ const col=cl<0?"#8a8a8a":CLUSTER_PAL[cl%CLUSTER_PAL.length];
+    traces.push({x:strongByCl[cl][0],y:strongByCl[cl][1],mode:"lines",opacity:0.75,
+      line:{color:col,width:1.7},hoverinfo:"skip",showlegend:false}); }
+  // nodes
+  const big5=new Set(META.big5);
+  const ncol=ring.map((s,k)=>comp[k]>=0?CLUSTER_PAL[comp[k]%CLUSTER_PAL.length]:"#cfcfcf");
+  const lw=ring.map(s=>big5.has(s)?2.1:0.6), lc=ring.map(s=>big5.has(s)?"#000":"#fff");
+  traces.push({x:node.map(p=>p[0]*1.06),y:node.map(p=>p[1]*1.06),mode:"markers",
+    marker:{size:13,color:ncol,symbol:"square",line:{width:lw,color:lc}},
+    text:ring,hovertemplate:"%{text}<extra></extra>",showlegend:false});
+  // labels + region labels
+  const ann=ring.map((s,k)=>({x:node[k][0]*1.2,y:node[k][1]*1.2,text:s,showarrow:false,
+    font:{size:comp[k]>=0?11:8.5,color:comp[k]>=0?CLUSTER_PAL[comp[k]%CLUSTER_PAL.length]:"#8a8a8a"}}));
+  let start=0;
+  META.regions.forEach(([name,states])=>{ const mid=start+states.length/2; const a=(90-mid*360/n)*Math.PI/180;
+    ann.push({x:1.45*Math.cos(a),y:1.45*Math.sin(a),text:"<b>"+name+"</b>",showarrow:false,font:{size:12,color:"#666"}});
+    start+=states.length; });
+  const nstrong=Object.values(strongByCl).reduce((a,d)=>a+d[0].filter(x=>x===null).length,0);
+  Plotly.react("network",traces,{
+    title:{text:"Co-membership clusters<br><sub>grey: pairs pooled together ≥60% of the time · "
+      +"coloured: clusters pooled together ≥75%</sub>",font:{size:15}},
+    xaxis:{visible:false,range:[-1.7,1.7]},yaxis:{visible:false,range:[-1.7,1.7],scaleanchor:"x"},
+    annotations:ann,margin:{l:10,r:10,t:60,b:10},height:560,plot_bgcolor:"#fff"},{displayModeBar:false});
+}
+
+// ---- scatter ----
+function drawScatter(){
+  const sub=scatterSubset(), xk=$("xk").value, yk=$("yk").value;
+  if(sel===null||!sub.includes(sel)) sel=defaultSel(sub);
+  const M=sub.map(i=>CELL.panels[i].M);
+  const t=[{type:"scattergl",x:sub.map(i=>rowObj(CELL.front[i],xk)),y:sub.map(i=>rowObj(CELL.front[i],yk)),
+    mode:"markers",customdata:sub,
+    marker:{size:9,color:M,colorscale:"Viridis",showscale:true,
+      colorbar:{title:{text:"number of pools",side:"right"}},line:{width:0.4,color:"#333"}},
+    text:sub.map(i=>"solution "+i+" · M="+CELL.panels[i].M+" pools"),
+    hovertemplate:"%{text}<br>"+META.labels[xk]+"=%{x:.3f}<br>"+META.labels[yk]+"=%{y:.3f}<extra></extra>"}];
+  t.push({type:"scattergl",x:[rowObj(CELL.front[sel],xk)],y:[rowObj(CELL.front[sel],yk)],mode:"markers",
+    marker:{size:18,color:"rgba(0,0,0,0)",line:{width:3,color:"#d62728"}},hoverinfo:"skip",showlegend:false});
+  Plotly.react("scatter",t,{title:"Click a point to inspect that solution",
+    xaxis:{title:META.labels[xk]},yaxis:{title:META.labels[yk]},
+    margin:{l:55,r:10,t:45,b:45},height:380,showlegend:false},{displayModeBar:false});
+  $("scatter").removeAllListeners&&$("scatter").removeAllListeners("plotly_click");
+  $("scatter").on("plotly_click",e=>{ if(e.points&&e.points[0].customdata!==undefined){
+    sel=e.points[0].customdata; drawSolution(); }});
+  drawSolution();
+}
+
+// ---- selected-solution panels ----
+function multi(P){ return P.pools.filter(p=>p.size>=2); }
+function drawSolution(){
+  const P=CELL.panels[sel]; drawMap(P); drawFdiv(P); drawChronic(P); drawStrain(P); drawDefection(P); drawTs(P);
+}
+function drawMap(P){
+  const U=META.usps, da={}; U.forEach((s,i)=>da[s]=P.delta[i]);
+  const traces=[]; const singles=P.pools.filter(p=>p.size===1).map(p=>p.members[0]);
+  if(singles.length) traces.push({type:"choropleth",locations:singles,locationmode:"USA-states",
+    z:singles.map(_=>0),colorscale:[[0,GREY],[1,GREY]],showscale:false,marker:{line:{color:"#fff",width:0.5}},
+    hovertext:singles,hoverinfo:"text",showlegend:false});
+  multi(P).forEach((p,k)=>{ const col=PALETTE[k%PALETTE.length];
+    traces.push({type:"choropleth",locations:p.members,locationmode:"USA-states",z:p.members.map(_=>1),
+      colorscale:[[0,col],[1,col]],showscale:false,marker:{line:{color:"#fff",width:0.5}},
+      hovertext:p.members.map(s=>s+"  δ="+(da[s]==null?"—":da[s].toFixed(2))),hoverinfo:"text",showlegend:false});
+    traces.push({type:"scattergeo",lon:[null],lat:[null],mode:"markers",marker:{size:12,color:col,symbol:"square"},
+      name:"Pool "+(k+1)+" — "+p.lab,showlegend:true}); });
+  if(singles.length) traces.push({type:"scattergeo",lon:[null],lat:[null],mode:"markers",
+    marker:{size:12,color:GREY,symbol:"square"},name:"single states",showlegend:true});
+  Plotly.react("map",traces,{geo:{scope:"usa",domain:{x:[0,0.66]},bgcolor:"rgba(0,0,0,0)"},
+    title:"Selected solution — "+P.M+" pools",margin:{l:0,r:0,t:45,b:0},height:430,
+    legend:{font:{size:10},x:0.68,xanchor:"left",y:0.5,yanchor:"middle",bgcolor:"rgba(255,255,255,0.6)"}},
+    {displayModeBar:false});
+}
+function drawFdiv(P){ const m=multi(P);
+  Plotly.react("fdiv",[{type:"bar",orientation:"h",y:m.map(p=>p.lab),x:m.map(p=>p.DP),marker:{color:"#d62728"}}],
+    {title:"Diversification: per-pool catastrophic D_P (TVaR, $B)",margin:{l:10,r:10,t:45,b:30},height:300},
+    {displayModeBar:false});
+}
+function drawChronic(P){ const m=multi(P);
+  Plotly.react("chronic",[{type:"bar",orientation:"h",y:m.map(p=>p.lab),x:m.map(p=>p.loss_years/p.n_years),
+    marker:{color:"#9467bd"},text:m.map(p=>p.loss_years+"/"+p.n_years+" yrs"),textposition:"auto"}],
+    {title:"Chronic loss: per-pool loss-year frequency",xaxis:{range:[0,1]},margin:{l:10,r:10,t:45,b:30},height:300},
+    {displayModeBar:false});
+}
+function drawStrain(P){ const t=multi(P).map(p=>({type:"box",name:p.lab+" (CV "+p.cv+")",
+    y:p.adeq.filter(x=>x!=null),boxpoints:"all",jitter:0.4,marker:{size:4}}));
+  Plotly.react("strain",t,{title:"Strain: within-pool spread of adequacy (coverage/premium)",
+    showlegend:false,yaxis:{title:"member adequacy"},xaxis:{tickangle:-30},margin:{l:40,r:10,t:45,b:60},height:320},
+    {displayModeBar:false});
+}
+function drawDefection(P){ const U=META.usps;
+  const d=P.delta.map(x=>x==null?0:x), order=U.map((s,i)=>i).sort((a,b)=>d[a]-d[b]);
+  Plotly.react("defection",[{type:"bar",x:order.map(i=>U[i]),y:order.map(i=>d[i]),
+    marker:{color:order.map(i=>d[i]>1e-9?"#d62728":"#2ca02c")},
+    hovertemplate:"%{x}: δ=%{y:.2f}<extra></extra>"}],
+    {title:"Defection: per-state defection δ  (red>0 wants out · green<0 winner)",
+     xaxis:{tickfont:{size:7}},margin:{l:40,r:10,t:45,b:40},height:320,shapes:[{type:"line",x0:-0.5,
+     x1:U.length-0.5,y0:0,y1:0,line:{color:"#000",width:1}}]},{displayModeBar:false});
+}
+function drawTs(P){ const ts=P.ts, x=ts.draws.map(String), traces=[];
+  ts.pools.forEach((p,k)=>traces.push({type:"bar",x,y:p.vals,name:p.lab,marker:{color:PALETTE[k%PALETTE.length]}}));
+  if(ts.singles) traces.push({type:"bar",x,y:ts.singles,name:"singletons",marker:{color:GREY}});
+  Plotly.react("timeseries",traces,{barmode:"stack",
+    title:"Simulation: per-pool uncovered shortfall stacked — top "+x.length+" draws",
+    xaxis:{title:"simulation draw",type:"category"},yaxis:{title:"$B (uncovered shortfall)"},
+    margin:{l:50,r:10,t:45,b:50},height:390,legend:{font:{size:9}}},{displayModeBar:false});
+}
+</script>
+</body>
+</html>
