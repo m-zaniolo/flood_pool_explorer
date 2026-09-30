@@ -83,7 +83,8 @@ function radio(host, opts, val, cb){
 }
 
 function init(){
-  radio($("price"), META.pricings.map(p=>[p,META.pricing_labels[p]]), META.pricings[0], v=>{price=v;newCell();});
+    const PRICE_LABEL = {actual:"current", fair:"historically balanced", RR2:"RR2.0"};
+  radio($("price"), META.pricings.map(p=>[p,PRICE_LABEL[p]||META.pricing_labels[p]]), META.pricings[0], v=>{price=v;newCell();});
   radio($("vote"), META.votes.map(v=>[v,"one "+v+" one vote"]), META.votes[0], v=>{vote=v;newCell();});
   OBJS.forEach(o=>{
     $("xk").add(new Option(META.labels[o],o));
