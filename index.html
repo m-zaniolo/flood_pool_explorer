@@ -28,15 +28,13 @@
 <h3>Flood insurance pool explorer</h3>
 <div class="bar">
   <b>pricing:</b><span class="radio" id="price"></span>
-  <label style="margin-left:14px">detail (ε thinning):</label>
-  <input type="range" min="3" max="6" step="1" value="5" id="bins" style="width:160px">
-  <span id="binsval">5</span>
   <button id="reset" style="margin-left:8px">reset brush</button>
 </div>
 
 <h4>The Pareto frontier at a glance</h4>
 <div class="hint">Every line is a Pareto-optimal pooling. Brush any axis to select a trade-off; the
-  cluster map redraws over the selection.</div>
+  cluster map redraws over the selection. <b>All axes are oriented so that lower = better</b>
+  (Diversification is reversed, since more of it is preferred).</div>
 <div class="row"><div id="parcoords" class="g"></div><div id="network" class="g"></div></div>
 
 <hr>
@@ -59,9 +57,9 @@ const PALETTE = ["#7F3C8D","#11A579","#3969AC","#F2B701","#E73F74","#80BA5A","#E
 const CLUSTER_PAL = ["#d62728","#1f77b4","#ff7f0e","#2ca02c","#9467bd","#8c564b","#e377c2",
                      "#17becf","#bcbd22","#7f7f7f"];
 const GREY="#d9d9d9", STRONG_WEAK="rgba(150,150,150,0.16)";
-const THR_WEAK=0.60, THR_STRONG=0.75;
+const THR_WEAK=0.75, THR_STRONG=0.90;   // grey shows 75-90%; >=90% coloured by cluster
 
-let DATA, META, OBJS, CELL, cell, bins=5, constraints={}, sel=null;
+let DATA, META, OBJS, CELL, cell, constraints={}, sel=null;
 
 const $=id=>document.getElementById(id);
 const objIdx=k=>OBJS.indexOf(k);
@@ -89,7 +87,6 @@ function init(){
   });
   $("xk").value=OBJS[0]; $("yk").value=OBJS[1];
   $("xk").onchange=$("yk").onchange=drawScatter;
-  $("bins").oninput=e=>{bins=+e.target.value;$("binsval").textContent=bins;constraints={};drawAll();};
   $("reset").onclick=()=>{constraints={};drawParcoords();updateBrush();};
   window.price=META.pricings[0]; window.vote=META.votes[0];   // single vote scenario (one state one vote)
   newCell();
@@ -108,7 +105,7 @@ function passes(row){
   }
   return true;
 }
-const shown=()=>CELL.shown[bins];
+const shown=()=>CELL.shown["all"];   // whole front; epsilon thinning removed
 const scatterSubset=()=>{ const s=shown().filter(i=>passes(CELL.front[i])); return s.length?s:shown(); };
 const networkSubset=()=>{ const all=[]; for(let i=0;i<CELL.front.length;i++) if(passes(CELL.front[i])) all.push(i); return all; };
 function defaultSel(sub){
@@ -121,7 +118,11 @@ function defaultSel(sub){
 function drawParcoords(){
   const idx=shown();
   const dims=OBJS.map((o,j)=>{
-    const d={label:META.labels[o], values:idx.map(i=>CELL.front[i][j])};
+    const v=idx.map(i=>CELL.front[i][j]);
+    const d={label:META.labels[o], values:v};
+    if(META.hib && META.hib[o]){            // higher is better -> reverse so down = better
+      d.range=[Math.max.apply(null,v), Math.min.apply(null,v)];
+    }
     if(constraints[j]) d.constraintrange=constraints[j];
     return d;
   });
@@ -197,8 +198,8 @@ function drawNetwork(){
     start+=states.length; });
   const nstrong=Object.values(strongByCl).reduce((a,d)=>a+d[0].filter(x=>x===null).length,0);
   Plotly.react("network",traces,{
-    title:{text:"Co-membership clusters<br><sub>grey: pairs pooled together ≥60% of the time · "
-      +"coloured: clusters pooled together ≥75%</sub>",font:{size:15}},
+    title:{text:"Co-membership clusters<br><sub>grey: pairs pooled together ≥75% of the time · "
+      +"coloured: clusters pooled together ≥90%</sub>",font:{size:15}},
     xaxis:{visible:false,range:[-1.7,1.7]},yaxis:{visible:false,range:[-1.7,1.7],scaleanchor:"x"},
     annotations:ann,margin:{l:10,r:10,t:60,b:10},height:560,plot_bgcolor:"#fff"},{displayModeBar:false});
 }
@@ -217,7 +218,9 @@ function drawScatter(){
   t.push({type:"scattergl",x:[rowObj(CELL.front[sel],xk)],y:[rowObj(CELL.front[sel],yk)],mode:"markers",
     marker:{size:18,color:"rgba(0,0,0,0)",line:{width:3,color:"#d62728"}},hoverinfo:"skip",showlegend:false});
   Plotly.react("scatter",t,{title:"Click a point to inspect that solution",
-    xaxis:{title:META.labels[xk]},yaxis:{title:META.labels[yk]},
+    xaxis:{title:META.labels[xk]+(META.hib&&META.hib[xk]?"  (better \u2192)":"  (\u2190 better)")},
+    yaxis:{title:META.labels[yk]+"  (better \u2193)",
+           autorange:(META.hib&&META.hib[yk])?true:"reversed"},
     margin:{l:55,r:10,t:45,b:45},height:380,showlegend:false},{displayModeBar:false});
   $("scatter").removeAllListeners&&$("scatter").removeAllListeners("plotly_click");
   $("scatter").on("plotly_click",e=>{ if(e.points&&e.points[0].customdata!==undefined){
@@ -273,12 +276,18 @@ function drawStrain(P){
 }
 function drawDefection(P){ const U=META.usps;
   const d=P.delta.map(x=>x==null?0:x), order=U.map((s,i)=>i).sort((a,b)=>d[a]-d[b]);
+  // One huge winner (delta can reach -13) would flatten every defector against the zero line, so
+  // the axis is clipped to a window around 0; clipped bars run off the bottom, hover gives exact values.
+  const pos=Math.max(0,...d), neg=Math.min(0,...d);
+  const hi=Math.max(pos*1.25,0.4), lo=Math.max(neg*1.05,-Math.max(3*hi,1.5));
+  const clipped=d.filter(v=>v<lo).length;
   Plotly.react("defection",[{type:"bar",x:order.map(i=>U[i]),y:order.map(i=>d[i]),
     marker:{color:order.map(i=>d[i]>1e-9?"#d62728":"#2ca02c")},
     hovertemplate:"%{x}: δ=%{y:.2f}<extra></extra>"}],
-    {title:"Defection: per-state defection δ  (red>0 wants out · green<0 winner)",
-     xaxis:{tickfont:{size:7}},margin:{l:40,r:10,t:45,b:40},height:320,shapes:[{type:"line",x0:-0.5,
-     x1:U.length-0.5,y0:0,y1:0,line:{color:"#000",width:1}}]},{displayModeBar:false});
+    {title:"Defection: per-state defection δ  (red>0 wants out · green<0 winner)"
+       +(clipped?"<br><sub>"+clipped+" big winner"+(clipped>1?"s":"")+" clipped — hover for exact δ</sub>":""),
+     xaxis:{tickfont:{size:7}},yaxis:{range:[lo,hi],zeroline:true,zerolinewidth:1,zerolinecolor:"#000"},
+     margin:{l:40,r:10,t:(clipped?58:45),b:40},height:320},{displayModeBar:false});
 }
 function drawTs(P){ const ts=P.ts, x=ts.draws.map(String), traces=[];
   ts.pools.forEach((p,k)=>traces.push({type:"bar",x,y:p.vals,name:p.lab,marker:{color:PALETTE[k%PALETTE.length]}}));
