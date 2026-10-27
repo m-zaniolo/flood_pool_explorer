@@ -28,7 +28,6 @@
 <h3>Flood insurance pool explorer</h3>
 <div class="bar">
   <b>pricing:</b><span class="radio" id="price"></span>
-  <b style="margin-left:14px">vote:</b><span class="radio" id="vote"></span>
   <label style="margin-left:14px">detail (ε thinning):</label>
   <input type="range" min="3" max="6" step="1" value="5" id="bins" style="width:160px">
   <span id="binsval">5</span>
@@ -83,9 +82,7 @@ function radio(host, opts, val, cb){
 }
 
 function init(){
-    const PRICE_LABEL = {actual:"current", fair:"historically balanced", RR2:"RR2.0"};
-  radio($("price"), META.pricings.map(p=>[p,PRICE_LABEL[p]||META.pricing_labels[p]]), META.pricings[0], v=>{price=v;newCell();});
-  radio($("vote"), META.votes.map(v=>[v,"one "+v+" one vote"]), META.votes[0], v=>{vote=v;newCell();});
+  radio($("price"), META.pricings.map(p=>[p,META.pricing_labels[p]]), META.pricings[0], v=>{price=v;newCell();});
   OBJS.forEach(o=>{
     $("xk").add(new Option(META.labels[o],o));
     $("yk").add(new Option(META.labels[o],o));
@@ -94,7 +91,7 @@ function init(){
   $("xk").onchange=$("yk").onchange=drawScatter;
   $("bins").oninput=e=>{bins=+e.target.value;$("binsval").textContent=bins;constraints={};drawAll();};
   $("reset").onclick=()=>{constraints={};drawParcoords();updateBrush();};
-  window.price=META.pricings[0]; window.vote=META.votes[0];
+  window.price=META.pricings[0]; window.vote=META.votes[0];   // single vote scenario (one state one vote)
   newCell();
 }
 
@@ -263,10 +260,15 @@ function drawChronic(P){ const m=multi(P);
     {title:"Chronic loss: per-pool loss-year frequency",xaxis:{range:[0,1]},margin:{l:10,r:10,t:45,b:30},height:300},
     {displayModeBar:false});
 }
-function drawStrain(P){ const t=multi(P).map(p=>({type:"box",name:p.lab+" (CV "+p.cv+")",
-    y:p.adeq.filter(x=>x!=null),boxpoints:"all",jitter:0.4,marker:{size:4}}));
-  Plotly.react("strain",t,{title:"Strain: within-pool spread of adequacy (coverage/premium)",
-    showlegend:false,yaxis:{title:"member adequacy"},xaxis:{tickangle:-30},margin:{l:40,r:10,t:45,b:60},height:320},
+function drawStrain(P){
+  const rows=[]; multi(P).forEach(p=>p.members.forEach((m,i)=>rows.push([m,p.strain[i],p.lab])));
+  rows.sort((a,b)=>a[1]-b[1]);
+  const t=[{type:"bar",x:rows.map(r=>r[0]),y:rows.map(r=>r[1]),
+            marker:{color:rows.map(r=>r[1]>0?"#e34948":"#2a78d6")},
+            hovertext:rows.map(r=>r[2]+" — strain "+r[1].toFixed(3)),hoverinfo:"text"}];
+  Plotly.react("strain",t,{title:"Strain (diagnostic): 1 − balance share / premium share, per member (Nayak et al. 2026)",
+    showlegend:false,yaxis:{title:"strain  (>0 strains the pool)",zeroline:true},
+    xaxis:{tickangle:-90,tickfont:{size:9}},margin:{l:50,r:10,t:45,b:50},height:320},
     {displayModeBar:false});
 }
 function drawDefection(P){ const U=META.usps;
